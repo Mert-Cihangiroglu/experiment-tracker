@@ -1,4 +1,4 @@
-# Lab Floor
+# experiment-tracker
 
 Portable install kit for tracking GPU experiments, tmux sessions, configs, and working directories on a remote server.
 
