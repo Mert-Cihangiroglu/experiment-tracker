@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""Lab Floor CLI — experiment registry, GPU/tmux reconciliation."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+REGISTRY = Path(os.environ.get("LAB_REGISTRY", Path.home() / ".lab" / "registry.yaml"))
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _load_registry() -> dict[str, Any]:
+    if not REGISTRY.exists():
+        return {"server": socket.gethostname(), "updated": None, "experiments": []}
+    text = REGISTRY.read_text()
+    if not text.strip():
+        return {"server": socket.gethostname(), "updated": None, "experiments": []}
+    try:
+        import yaml  # type: ignore
+    except ImportError:
+        return _load_registry_minimal(text)
+    data = yaml.safe_load(text) or {}
+    data.setdefault("experiments", [])
+    return data
+
+
+def _load_registry_minimal(text: str) -> dict[str, Any]:
+    """Tiny YAML subset parser when PyYAML is missing."""
+    data: dict[str, Any] = {"server": socket.gethostname(), "updated": None, "experiments": []}
+    for line in text.splitlines():
+        if line.startswith("server:"):
+            data["server"] = line.split(":", 1)[1].strip()
+        elif line.startswith("updated:"):
+            val = line.split(":", 1)[1].strip()
+            data["updated"] = None if val in ("null", "~", "") else val.strip('"')
+    return data
+
+
+def _save_registry(data: dict[str, Any]) -> None:
+    data["updated"] = _now_iso()
+    REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import yaml  # type: ignore
+
+        REGISTRY.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
+    except ImportError:
+        REGISTRY.write_text(_dump_registry_minimal(data))
+
+
+def _dump_registry_minimal(data: dict[str, Any]) -> str:
+    lines = [
+        "# Lab Floor registry",
+        f"server: {data.get('server', socket.gethostname())}",
+        f"updated: {json.dumps(data.get('updated'))}",
+        "",
+        "experiments:",
+    ]
+    for exp in data.get("experiments", []):
+        lines.append(f"  - id: {exp.get('id', 'unknown')}")
+        for key in ("path", "status", "session", "command", "config", "started", "notes"):
+            if key in exp and exp[key] is not None:
+                val = exp[key]
+                if isinstance(val, str) and (":" in val or " " in val or '"' in val):
+                    val = json.dumps(val)
+                lines.append(f"    {key}: {val}")
+        if "gpu" in exp:
+            gpu = exp["gpu"]
+            if isinstance(gpu, list):
+                lines.append(f"    gpu: [{', '.join(str(g) for g in gpu)}]")
+            else:
+                lines.append(f"    gpu: {gpu}")
+    return "\n".join(lines) + "\n"
+
+
+def _run(cmd: list[str], timeout: int = 15) -> str:
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return ""
+
+
+def _gpu_snapshot() -> list[dict[str, Any]]:
+    gpus: list[dict[str, Any]] = []
+    listing = _run(["nvidia-smi", "-L"])
+    if not listing:
+        return gpus
+    for i, line in enumerate(listing.splitlines()):
+        m = re.match(r"GPU (\d+):", line)
+        idx = int(m.group(1)) if m else i
+        gpus.append({"index": idx, "name": line, "processes": []})
+
+    csv = _run(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=gpu_uuid,gpu_bus_id,pid,process_name,used_gpu_memory",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    uuid_map: dict[str, int] = {}
+    for line in _run(["nvidia-smi", "-L"]).splitlines():
+        m = re.match(r"GPU (\d+):.*\(UUID: ([^)]+)\)", line)
+        if m:
+            uuid_map[m.group(2).strip()] = int(m.group(1))
+
+    if csv:
+        for row in csv.splitlines():
+            parts = [p.strip() for p in row.split(",")]
+            if len(parts) < 4:
+                continue
+            pid = parts[2] if parts[2].isdigit() else None
+            proc = parts[3] if len(parts) > 3 else ""
+            mem = parts[4] if len(parts) > 4 else ""
+            gpu_idx = uuid_map.get(parts[0], None)
+            if gpu_idx is None and len(gpus) == 1:
+                gpu_idx = 0
+            if gpu_idx is not None and gpu_idx < len(gpus):
+                gpus[gpu_idx]["processes"].append({"pid": pid, "name": proc, "memory_mb": mem})
+    return gpus
+
+
+def _tmux_sessions() -> list[str]:
+    out = _run(["tmux", "ls"])
+    if not out:
+        return []
+    sessions = []
+    for line in out.splitlines():
+        name = line.split(":")[0].strip()
+        if name:
+            sessions.append(name)
+    return sessions
+
+
+def _session_alive(session: str) -> bool:
+    if session.startswith("tmux:"):
+        name = session[5:]
+        return name in _tmux_sessions()
+    if session.startswith("pid:"):
+        pid = session[4:]
+        return pid.isdigit() and Path(f"/proc/{pid}").exists()
+    return True
+
+
+def cmd_status(_: argparse.Namespace) -> int:
+    data = _load_registry()
+    gpus = _gpu_snapshot()
+    tmux = _tmux_sessions()
+    running = [e for e in data.get("experiments", []) if e.get("status") == "running"]
+
+    print(f"# Lab Floor — {data.get('server', socket.gethostname())}")
+    print(f"updated: {data.get('updated') or 'never'}")
+    print()
+
+    if gpus:
+        print("## GPUs")
+        for g in gpus:
+            procs = g["processes"]
+            if procs:
+                detail = ", ".join(f"pid {p['pid']} {p['name']}" for p in procs)
+                print(f"- GPU {g['index']}: busy — {detail}")
+            else:
+                print(f"- GPU {g['index']}: free")
+        print()
+    else:
+        print("## GPUs\n(nvidia-smi not available)\n")
+
+    if tmux:
+        print("## tmux sessions")
+        for s in tmux:
+            print(f"- {s}")
+        print()
+    else:
+        print("## tmux sessions\n(none)\n")
+
+    print("## Registered experiments (running)")
+    if not running:
+        print("(none)")
+    else:
+        for e in running:
+            gpu = e.get("gpu", "?")
+            print(
+                f"- {e.get('id')}: gpu={gpu} session={e.get('session')} path={e.get('path')}"
+            )
+    return 0
+
+
+def cmd_list(_: argparse.Namespace) -> int:
+    data = _load_registry()
+    for e in data.get("experiments", []):
+        print(
+            f"{e.get('status','?'):8}  {e.get('id','?'):24}  gpu={e.get('gpu','?')}  {e.get('path','')}"
+        )
+    return 0
+
+
+def cmd_context(_: argparse.Namespace) -> int:
+    """Machine-readable context block for agents (stdout)."""
+    data = _load_registry()
+    gpus = _gpu_snapshot()
+    tmux = _tmux_sessions()
+    running = [e for e in data.get("experiments", []) if e.get("status") == "running"]
+
+    lines = [
+        "<lab-floor-context>",
+        f"server: {data.get('server', socket.gethostname())}",
+        f"registry: {REGISTRY}",
+        f"registry_updated: {data.get('updated') or 'never'}",
+        "",
+        "Live GPUs:",
+    ]
+    if gpus:
+        for g in gpus:
+            if g["processes"]:
+                lines.append(f"  GPU {g['index']}: BUSY — {g['processes']}")
+            else:
+                lines.append(f"  GPU {g['index']}: FREE")
+    else:
+        lines.append("  (nvidia-smi unavailable)")
+
+    lines.append("")
+    lines.append("tmux sessions: " + (", ".join(tmux) if tmux else "(none)"))
+    lines.append("")
+    lines.append("Running experiments (registry):")
+    if running:
+        for e in running:
+            lines.append(
+                f"  - id={e.get('id')} gpu={e.get('gpu')} session={e.get('session')} "
+                f"path={e.get('path')} cmd={e.get('command', '')[:120]}"
+            )
+    else:
+        lines.append("  (none registered)")
+
+    lines.extend(
+        [
+            "",
+            "Agent rules:",
+            "  - Run `lab status` before experiment/GPU work",
+            "  - Register new jobs with `lab register` immediately after launch",
+            "  - Run `lab sync` to mark dead tmux/pid sessions as failed",
+            "  - If not in registry, it does not exist",
+            "</lab-floor-context>",
+        ]
+    )
+    print("\n".join(lines))
+    return 0
+
+
+def cmd_register(args: argparse.Namespace) -> int:
+    data = _load_registry()
+    exps = data.setdefault("experiments", [])
+    gpu = [int(x) for x in args.gpu.split(",")] if args.gpu else []
+
+    entry = {
+        "id": args.id,
+        "path": str(Path(args.path).expanduser().resolve()) if args.path else None,
+        "gpu": gpu,
+        "status": args.status or "running",
+        "session": args.session,
+        "command": args.command,
+        "config": args.config,
+        "started": args.started or _now_iso(),
+        "notes": args.notes,
+    }
+    entry = {k: v for k, v in entry.items() if v is not None}
+
+    replaced = False
+    for i, e in enumerate(exps):
+        if e.get("id") == args.id:
+            exps[i] = {**e, **entry}
+            replaced = True
+            break
+    if not replaced:
+        exps.append(entry)
+
+    _save_registry(data)
+    print(f"registered: {args.id} ({'updated' if replaced else 'new'})")
+    return 0
+
+
+def cmd_sync(_: argparse.Namespace) -> int:
+    data = _load_registry()
+    changed = 0
+    for e in data.get("experiments", []):
+        if e.get("status") != "running":
+            continue
+        session = e.get("session", "")
+        if session and not _session_alive(session):
+            e["status"] = "failed"
+            e["notes"] = (e.get("notes") or "") + f" [lab sync {_now_iso()}: session gone]"
+            changed += 1
+    if changed:
+        _save_registry(data)
+    print(f"synced: {changed} experiment(s) marked failed (dead session)")
+    return 0
+
+
+def main() -> int:
+    global REGISTRY
+
+    parser = argparse.ArgumentParser(description="Lab Floor — experiment registry")
+    parser.add_argument("--registry", default=str(REGISTRY), help="registry yaml path")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status", help="human-readable snapshot").set_defaults(func=cmd_status)
+    sub.add_parser("list", help="list all experiments").set_defaults(func=cmd_list)
+    sub.add_parser("context", help="context block for agents (stdout)").set_defaults(func=cmd_context)
+    sub.add_parser("sync", help="reconcile registry with live sessions").set_defaults(func=cmd_sync)
+
+    reg = sub.add_parser("register", help="add or update an experiment")
+    reg.add_argument("--id", required=True)
+    reg.add_argument("--path")
+    reg.add_argument("--gpu", help="comma-separated GPU indices, e.g. 0,1")
+    reg.add_argument("--session", help="tmux:name | pid:1234 | slurm:jobid")
+    reg.add_argument("--command")
+    reg.add_argument("--config")
+    reg.add_argument("--status", default="running")
+    reg.add_argument("--started")
+    reg.add_argument("--notes")
+    reg.set_defaults(func=cmd_register)
+
+    args = parser.parse_args()
+    REGISTRY = Path(args.registry).expanduser()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

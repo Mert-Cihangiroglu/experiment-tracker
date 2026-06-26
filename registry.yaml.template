@@ -1,0 +1,17 @@
+# Lab Floor registry — single source of truth for GPU experiments
+# Copy to ~/.lab/registry.yaml on install. Edit via `lab register` or by hand.
+
+server: CHANGE_ME_HOSTNAME
+updated: null
+
+experiments: []
+# Example entry (delete or replace):
+#   - id: es-ft-v3-lr1e5
+#     path: /home/user/projects/es-ft/runs/2026-06-26-es-ft-v3
+#     gpu: [0, 1]
+#     status: running          # running | done | failed | killed | unknown
+#     session: tmux:train-v3    # tmux:<name> | screen:<name> | pid:<pid> | slurm:<jobid>
+#     command: "torchrun --nproc_per_node=2 train.py --config configs/lr1e5.yaml"
+#     config: configs/lr1e5.yaml
+#     started: "2026-06-26T09:00:00Z"
+#     notes: "baseline before lr sweep"
